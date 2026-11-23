@@ -27,6 +27,8 @@ export interface DrawOpts {
   alpha?: number;
   onDefense: boolean;
   time: number;
+  /** Outline thickness multiplier (thinner for distant background players). */
+  outline?: number;
 }
 
 /** Seven-segment style digits for jersey numbers (segment endpoints in a 0..1 x 0..2 box). */
@@ -114,6 +116,26 @@ export class PlayerRenderer {
       case 'stumble':
         hR = j(-0.4, 1.4, 5.3); hL = j(0.2, -1.4, 5.0);
         break;
+      case 'crossover': {
+        // Low, wide stance while the ball crosses in front of the body
+        const b = toLocal(ball.x, ball.y, ball.z);
+        const hand = j(b.f / hs, b.s / Math.sqrt(hs), Math.max(1.6, (b.z + 0.42) / hs));
+        if (b.s < 0) { hL = hand; hR = j(0.3, 1.2, 3.6); } else { hR = hand; hL = j(0.3, -1.2, 3.6); }
+        footL.s = -0.8; footR.s = 0.8; kneeL.s = -0.75; kneeR.s = 0.75; kneeL.z -= 0.3; kneeR.z -= 0.3;
+        break;
+      }
+      case 'ankles': {
+        // Fell over: sitting on the floor, leaning back on the hands
+        const t = Math.min(1, p.actionT / 0.25);
+        const drop = 2.4 * t;
+        hipL.z -= drop; hipR.z -= drop; hipL.f -= 0.8 * t; hipR.f -= 0.8 * t;
+        shL.z -= drop * 0.95; shR.z -= drop * 0.95; shL.f -= 1.5 * t; shR.f -= 1.5 * t;
+        head.z -= drop * 0.95; head.f -= 1.6 * t;
+        footL.f = 1.4 * t; footR.f = 1.2 * t; footL.z = 0.2; footR.z = 0.5 * t;
+        kneeL.f = 0.9 * t; kneeR.f = 0.7 * t; kneeL.z = 1.2; kneeR.z = 1.5;
+        hL = j(-1.6 * t, -0.9, 0.2 + 3 * (1 - t)); hR = j(-1.6 * t, 0.9, 0.2 + 3 * (1 - t));
+        break;
+      }
       case 'celebrate': {
         const up = Math.abs(Math.sin(opts.time * 6 + p.id));
         hR = j(0.2, 0.6, 7.6 + up * 0.3); hL = j(0.2, -0.6, 7.6 + up * 0.3);
@@ -127,7 +149,9 @@ export class PlayerRenderer {
             // holding the ball at the chest
             hR = j(b.f / hs - 0.1, 0.38, ball.z / hs); hL = j(b.f / hs - 0.1, -0.38, ball.z / hs);
           } else {
-            hR = j(b.f / hs, b.s / Math.sqrt(hs), Math.max(2.35, Math.min(3.6, (b.z + 0.42) / hs)));
+            // Dribble with whichever hand is on the ball's side.
+            const hand = j(b.f / hs, b.s / Math.sqrt(hs), Math.max(2.35, Math.min(3.6, (b.z + 0.42) / hs)));
+            if (b.s < 0) hL = hand; else hR = hand;
           }
         }
     }
@@ -164,7 +188,7 @@ export class PlayerRenderer {
     const reflect = !!opts.reflect;
     const k0 = project(p.x, p.y, 0).k * VIS;
     const s = k0 / 22; // global pixel scale
-    const ol = reflect ? 0 : 2.4 * s;
+    const ol = reflect ? 0 : 2.4 * s * (opts.outline ?? 1);
 
     type W = { x: number; y: number; z: number; sx: number; sy: number };
     const W = (q: J): W => {

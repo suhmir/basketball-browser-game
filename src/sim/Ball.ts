@@ -1,4 +1,4 @@
-import { COURT, PHYS } from '../config';
+import { COURT, PHYS, type Hoop } from '../config';
 import type { Player, Side } from './Player';
 
 export type BallState = 'held' | 'shot' | 'pass' | 'loose' | 'dead';
@@ -7,6 +7,7 @@ export type ShotResult = 'swish' | 'rimIn' | 'rimOut' | 'boardOut' | 'airball' |
 
 export interface ShotInfo {
   shooter: Player;
+  hoop: Hoop;
   result: ShotResult;
   points: 2 | 3;
   t: number;
@@ -25,11 +26,11 @@ export interface PassInfo {
   checked: Set<number>;
 }
 
-/** Events emitted from ball physics that the match turns into sounds / effects. */
+/** Contact reported by the ball physics so the match can play sounds / effects. */
 export type BallContact = 'floor' | 'rim' | 'board' | null;
 
 export class Ball {
-  x = 25; y = 30; z = 3;
+  x = 47; y = 25; z = 3;
   vx = 0; vy = 0; vz = 0;
   state: BallState = 'held';
   owner: Player | null = null;
@@ -42,8 +43,6 @@ export class Ball {
   reboundable = false;
   spin = 0;
   dribblePhase = 0;
-  /** Time since last floor contact – used to throttle bounce sounds. */
-  sinceBounce = 0;
   throughHoop = false;
 
   /** Ballistic velocity so the ball goes from current position to (tx,ty,tz) in T seconds. */
@@ -69,7 +68,7 @@ export class Ball {
     this.spin += Math.hypot(this.vx, this.vy) * dt * 0.9;
   }
 
-  /** Free physics with floor, rim and backboard. Returns the strongest contact this step. */
+  /** Free physics with floor, rims and backboards. Returns the strongest contact this step. */
   physics(dt: number): BallContact {
     let contact: BallContact = null;
     const steps = 3;
@@ -79,7 +78,6 @@ export class Ball {
       const c = this.collide();
       if (c) contact = c;
     }
-    this.sinceBounce += dt;
     return contact;
   }
 
@@ -96,53 +94,54 @@ export class Ball {
         this.vy *= 0.86;
         if (impact > 3) contact = 'floor';
       }
-      // rolling friction
-      if (this.vz === 0) {
-        this.vx *= 0.985;
-        this.vy *= 0.985;
+      if (this.vz === 0) { this.vx *= 0.985; this.vy *= 0.985; }
+    }
+
+    for (const H of COURT.HOOPS) {
+      // Backboard: vertical plane perpendicular to x, facing into the court.
+      const B = COURT.BOARD;
+      const bx = H.dir === 1 ? B.inset : COURT.L - B.inset;
+      if (this.y > B.y0 - R && this.y < B.y1 + R && this.z > B.z0 - R && this.z < B.z1 + R) {
+        const front = (this.x - bx) * H.dir; // distance in front of the board
+        const approaching = this.vx * H.dir < 0;
+        if (front < R && front > -0.6 && approaching) {
+          this.x = bx + H.dir * R;
+          this.vx = -this.vx * PHYS.BOARD_RESTITUTION;
+          contact = 'board';
+        }
+      }
+
+      // Rim: torus approximated by the closest point on the rim circle.
+      const dx = this.x - H.x;
+      const dy = this.y - H.y;
+      const dh = Math.hypot(dx, dy) || 0.0001;
+      if (dh > COURT.RIM_R + 1.5 || Math.abs(this.z - H.z) > 1.5) continue;
+      const cx = H.x + (dx / dh) * COURT.RIM_R;
+      const cy = H.y + (dy / dh) * COURT.RIM_R;
+      const nx = this.x - cx;
+      const ny = this.y - cy;
+      const nz = this.z - H.z;
+      const nd = Math.hypot(nx, ny, nz);
+      const tube = 0.05;
+      if (nd < R + tube) {
+        const ux = nx / nd; const uy = ny / nd; const uz = nz / nd;
+        const vn = this.vx * ux + this.vy * uy + this.vz * uz;
+        if (vn < 0) {
+          this.vx -= (1 + PHYS.RIM_RESTITUTION) * vn * ux;
+          this.vy -= (1 + PHYS.RIM_RESTITUTION) * vn * uy;
+          this.vz -= (1 + PHYS.RIM_RESTITUTION) * vn * uz;
+          this.vx += (Math.random() - 0.5) * 2.2;
+          this.vy += (Math.random() - 0.5) * 2.2;
+          contact = 'rim';
+        }
+        const push = R + tube - nd;
+        this.x += ux * push; this.y += uy * push; this.z += uz * push;
       }
     }
 
-    // Backboard (vertical plane y = BOARD.y facing +y)
-    const B = COURT.BOARD;
-    if (this.x > B.x0 - R && this.x < B.x1 + R && this.z > B.z0 - R && this.z < B.z1 + R) {
-      if (this.y - R < B.y && this.y > B.y - 0.6 && this.vy < 0) {
-        this.y = B.y + R;
-        this.vy = -this.vy * PHYS.BOARD_RESTITUTION;
-        contact = 'board';
-      }
-    }
-
-    // Rim: torus approximated by closest point on the rim circle.
-    const H = COURT.HOOP;
-    const dx = this.x - H.x;
-    const dy = this.y - H.y;
-    const dh = Math.hypot(dx, dy) || 0.0001;
-    const cx = H.x + (dx / dh) * COURT.RIM_R;
-    const cy = H.y + (dy / dh) * COURT.RIM_R;
-    const nx = this.x - cx;
-    const ny = this.y - cy;
-    const nz = this.z - H.z;
-    const nd = Math.hypot(nx, ny, nz);
-    const rimTube = 0.05;
-    if (nd < R + rimTube) {
-      const ux = nx / nd; const uy = ny / nd; const uz = nz / nd;
-      const vn = this.vx * ux + this.vy * uy + this.vz * uz;
-      if (vn < 0) {
-        this.vx -= (1 + PHYS.RIM_RESTITUTION) * vn * ux;
-        this.vy -= (1 + PHYS.RIM_RESTITUTION) * vn * uy;
-        this.vz -= (1 + PHYS.RIM_RESTITUTION) * vn * uz;
-        // a little randomness keeps rebounds from being robotic
-        this.vx += (Math.random() - 0.5) * 2.2;
-        this.vy += (Math.random() - 0.5) * 2.2;
-        contact = 'rim';
-      }
-      const push = R + rimTube - nd;
-      this.x += ux * push; this.y += uy * push; this.z += uz * push;
-    }
-
-    // Net/stanchion: stop balls from flying through the support behind the board
-    if (this.y < -2 && this.vy < 0) { this.vy = -this.vy * 0.4; this.y = -2; }
+    // Stanchions behind each baseline stop the ball
+    if (this.x < -2.5 && this.vx < 0) { this.vx = -this.vx * 0.4; this.x = -2.5; }
+    if (this.x > COURT.L + 2.5 && this.vx > 0) { this.vx = -this.vx * 0.4; this.x = COURT.L + 2.5; }
     return contact;
   }
 }

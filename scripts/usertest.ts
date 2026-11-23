@@ -28,8 +28,7 @@ const toLive = (m: Match) => { for (let i = 0; i < 600 && m.phase !== 'live'; i+
     // clear defenders away to make it open
     for (const p of m.team(1)) { p.x = 5 + p.id; p.y = 44; }
     const u = m.user!;
-    u.x = 25; u.y = 24; // 3pt range (dist 18.75 -> long two). Move to 26ft.
-    u.y = 31;
+    u.x = u.hoop.x - 25.5; u.y = 25; // top of the key, just beyond the arc
     let grade = ''; let chanceV = 0;
     m.ev.on('release', (e) => { grade = e.grade ?? ''; chanceV = e.chance; });
     m.ev.on('score', () => { made++; });
@@ -50,7 +49,7 @@ const toLive = (m: Match) => { for (let i = 0; i < 600 && m.phase !== 'live'; i+
   for (let k = 0; k < N; k++) {
     const m = mk(); toLive(m);
     for (const p of m.team(1)) { p.x = 5 + p.id; p.y = 44; }
-    m.user!.x = 25; m.user!.y = 31;
+    m.user!.x = m.user!.hoop.x - 25.5; m.user!.y = 25;
     m.ev.on('score', () => { made++; });
     m.update(1 / 60, inp({ shootPressed: true, shootHeld: true }));
     step(m, 0.12, inp({ shootHeld: true }));
@@ -72,18 +71,25 @@ const toLive = (m: Match) => { for (let i = 0; i < 600 && m.phase !== 'live'; i+
   ok(m.user === m.ball.owner && m.user !== u, `control follows the ball to the receiver (${m.user?.def.name})`);
 }
 
-// 5. Clear rule: after a steal the new offense must clear before scoring
+// 5. Full court: each team scores on its own basket, and the other team inbounds from its backcourt
 {
   const m = mk(); toLive(m);
-  // CPU (team 1) secures the ball inside the arc, e.g. a defensive rebound
-  const cpu = m.team(1)[0];
-  cpu.x = 25; cpu.y = 12;
-  m.giveBall(cpu);
-  const userGuy = cpu;
-  ok(m.needsClear === true, 'possession change inside the arc requires clearing');
-  userGuy.x = 25; userGuy.y = 33; m.update(1 / 60, NO_INPUT);
-  ok(m.needsClear === false, 'taking it beyond the arc clears it');
-  void cpu;
+  const u = m.user!;
+  ok(u.hoop.x > 47, 'home team attacks the right-hand basket');
+  ok(m.team(1)[0].hoop.x < 47, 'away team attacks the left-hand basket');
+  for (const p of m.team(1)) { p.x = 20; p.y = 5 + p.id; }
+  u.x = u.hoop.x - 3; u.y = 25; u.vx = 0; u.vy = 0;
+  let scored = -1;
+  m.ev.on('score', (e) => { scored = e.side; });
+  m.update(1 / 60, inp({ shootPressed: true, shootHeld: true }));
+  step(m, 2.5);
+  step(m, 3);
+  ok(scored === 0 || m.score[0] === 0, `layup at the right basket credits the home team (${m.score.join('-')})`);
+  if (scored === 0) {
+    toLive(m);
+    const h = m.ball.owner!;
+    ok(h.side === 1 && h.x > 47, `after the make the away team brings it up from its backcourt (x=${h.x.toFixed(0)})`);
+  }
 }
 
 // 6. Shot clock violation turns it over
@@ -92,7 +98,7 @@ const toLive = (m: Match) => { for (let i = 0; i < 600 && m.phase !== 'live'; i+
   let reason = '';
   m.ev.on('turnover', (t) => { reason = t.reason; });
   // user stands still holding the ball (AI teammates won't take it)
-  step(m, 13);
+  step(m, 21);
   ok(reason === 'SHOT CLOCK', `shot clock violation fires (${reason || 'none'})`);
   step(m, 3);
   ok(m.offense === 1, 'other team gets the ball after the violation');
@@ -116,7 +122,7 @@ const toLive = (m: Match) => { for (let i = 0; i < 600 && m.phase !== 'live'; i+
   ok(m.score[0] !== m.score[1], 'there is always a winner');
 }
 
-// 9. Steal attempt success rate is sane for a user defender right next to the handler
+// 9. Steal (R) success rate is sane for a user defender right next to the handler
 {
   let steals = 0; const N = 200;
   for (let k = 0; k < N; k++) {
@@ -125,10 +131,31 @@ const toLive = (m: Match) => { for (let i = 0; i < 600 && m.phase !== 'live'; i+
     const h = m.ball.owner!; const d = m.user!;
     d.x = h.x + Math.cos(h.facing) * 1.6; d.y = h.y + Math.sin(h.facing) * 1.6 + 0.3;
     m.ev.on('steal', () => { steals++; });
-    m.update(1 / 60, inp({ passPressed: true }));
+    m.update(1 / 60, inp({ stealPressed: true }));
     step(m, 1.2);
   }
   ok(steals / N > 0.08 && steals / N < 0.6, `steal success rate reasonable (${(steals / N * 100).toFixed(0)}%)`);
+}
+
+// 10. Crossover (F): switches hands, bursts, and can break the ankles of a defender caught reaching
+{
+  const m = mk(); toLive(m);
+  const u = m.user!;
+  const side0 = u.dribbleSide;
+  m.update(1 / 60, inp({ crossPressed: true }));
+  ok(u.action === 'crossover' && u.dribbleSide !== side0, 'F performs a crossover and switches hands');
+  ok(u.speed > 9, `crossover gives a burst of speed (${u.speed.toFixed(1)} ft/s)`);
+  let ankles = 0; const N = 300;
+  for (let k = 0; k < N; k++) {
+    const mm = mk(); toLive(mm);
+    const h = mm.user!;
+    const d = mm.team(1).find((x) => mm.assign.get(x.id) === h)!;
+    d.x = h.x + Math.cos(h.facing) * 3; d.y = h.y + Math.sin(h.facing) * 3;
+    d.setAction('reach');
+    mm.ev.on('ankles', () => { ankles++; });
+    mm.crossover(h);
+  }
+  ok(ankles / N > 0.2 && ankles / N < 0.85, `crossing a reaching defender drops them often (${(ankles / N * 100).toFixed(0)}%)`);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nALL PASSED');

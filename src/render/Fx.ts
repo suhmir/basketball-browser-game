@@ -3,7 +3,7 @@ import { PHYS, SHOT } from '../config';
 import { project, Z_SCALE } from '../core/projection';
 import type { Ball } from '../sim/Ball';
 import type { Player } from '../sim/Player';
-import { depthOf } from './Arena';
+import { depthOf } from './Park';
 
 const BALL_COL = 0xe8742c;
 
@@ -14,7 +14,8 @@ export class Fx {
   private trailG: Phaser.GameObjects.Graphics;
   private ringG: Phaser.GameObjects.Graphics;
   private trail: { x: number; y: number; r: number }[] = [];
-  private rings: { x: number; y: number; r: number; t: number; color: number; life: number }[] = [];
+  private rings: { x: number; y: number; z: number; r: number; t: number; color: number; life: number }[] = [];
+  private pops: { text: Phaser.GameObjects.Text; x: number; y: number; z: number; rise: { v: number } }[] = [];
   private confetti: Phaser.GameObjects.Particles.ParticleEmitter;
   private sparks: Phaser.GameObjects.Particles.ParticleEmitter;
   private dust: Phaser.GameObjects.Particles.ParticleEmitter;
@@ -127,19 +128,26 @@ export class Fx {
   }
 
   ring(wx: number, wy: number, wz: number, color: number, maxR = 60, life = 0.45) {
-    const p = project(wx, wy, wz);
-    this.rings.push({ x: p.x, y: p.y, r: maxR, t: 0, color, life });
+    this.rings.push({ x: wx, y: wy, z: wz, r: maxR, t: 0, color, life });
   }
 
+  /** Per-frame update for world-anchored rings and floating text. */
   updateRings(dt: number) {
     const g = this.ringG;
     g.clear();
     this.rings = this.rings.filter((r) => (r.t += dt) < r.life);
     for (const r of this.rings) {
       const u = r.t / r.life;
+      const p = project(r.x, r.y, r.z);
       g.lineStyle(6 * (1 - u) + 1, r.color, 1 - u);
-      g.strokeCircle(r.x, r.y, r.r * (0.2 + u * 0.8));
+      g.strokeCircle(p.x, p.y, r.r * (0.2 + u * 0.8));
     }
+    for (const pt of this.pops) {
+      const p = project(pt.x, pt.y, pt.z);
+      pt.text.x = p.x;
+      pt.text.y = p.y - pt.rise.v;
+    }
+    this.pops = this.pops.filter((pt) => pt.text.active);
   }
 
   burst(wx: number, wy: number, wz: number, colors: number[], count = 40) {
@@ -162,7 +170,7 @@ export class Fx {
     this.dust.explode(count, p.x, p.y);
   }
 
-  /** Floating text that rises and fades (world-anchored). */
+  /** Floating text that rises and fades, pinned to a world point. */
   popText(wx: number, wy: number, wz: number, text: string, color: string, size = 56, rise = 90, hold = 650) {
     const p = project(wx, wy, wz);
     const t = this.scene.add.text(p.x, p.y, text, {
@@ -170,34 +178,47 @@ export class Fx {
       stroke: '#120d16', strokeThickness: Math.round(size / 7),
     }).setOrigin(0.5).setDepth(6000).setScale(0.4);
     t.setShadow(0, 4, 'rgba(0,0,0,0.5)', 8, true, true);
+    const r = { v: 0 };
+    this.pops.push({ text: t, x: wx, y: wy, z: wz, rise: r });
     this.scene.tweens.add({ targets: t, scale: 1, duration: 180, ease: 'Back.Out' });
-    this.scene.tweens.add({
-      targets: t, y: p.y - rise, alpha: 0, delay: hold, duration: 600, ease: 'Cubic.In',
-      onComplete: () => t.destroy(),
-    });
+    this.scene.tweens.add({ targets: r, v: rise, delay: hold, duration: 600, ease: 'Cubic.In' });
+    this.scene.tweens.add({ targets: t, alpha: 0, delay: hold, duration: 600, ease: 'Cubic.In', onComplete: () => t.destroy() });
   }
 
-  /** Shot meter next to the shooter. */
+  /**
+   * Shot meter drawn on the floor under the shooter: a horizontal bar that
+   * fills left to right, with the release window marked.
+   */
   drawMeter(g: Phaser.GameObjects.Graphics, p: Player, frozenValue: number | null, frozenColor: number) {
-    const base = project(p.x, p.y, p.z + p.def.height * 0.75);
-    const h = 92;
-    const w = 13;
-    const x = base.x + base.k * 1.5;
-    const y = base.y - h / 2;
-    const v = Math.min(1.12, frozenValue ?? p.charge);
-    const toY = (m: number) => y + h - (m / SHOT.AUTO_RELEASE) * h;
-    g.fillStyle(0x0b0d14, 0.85);
-    g.fillRoundedRect(x - 3, y - 3, w + 6, h + 6, 5);
-    // windows
-    g.fillStyle(0x2f6b3a, 0.9);
-    g.fillRect(x, toY(SHOT.PERFECT + SHOT.GOOD_WINDOW), w, toY(SHOT.PERFECT - SHOT.GOOD_WINDOW) - toY(SHOT.PERFECT + SHOT.GOOD_WINDOW));
+    const base = project(p.x, p.y + 1.4, 0);
+    const w = 132;
+    const h = 16;
+    const x = base.x - w / 2;
+    const y = base.y + 6;
+    const v = Math.min(SHOT.AUTO_RELEASE, frozenValue ?? p.charge);
+    const toX = (m: number) => x + (m / SHOT.AUTO_RELEASE) * w;
+    // frame
+    g.fillStyle(0x07080e, 0.88);
+    g.fillRoundedRect(x - 4, y - 4, w + 8, h + 8, 7);
+    g.fillStyle(0x1c2030, 1);
+    g.fillRoundedRect(x, y, w, h, 4);
+    // release windows
+    g.fillStyle(0x2f6b3a, 1);
+    g.fillRect(toX(SHOT.PERFECT - SHOT.GOOD_WINDOW), y, toX(SHOT.PERFECT + SHOT.GOOD_WINDOW) - toX(SHOT.PERFECT - SHOT.GOOD_WINDOW), h);
     g.fillStyle(0x5cff7a, 1);
-    g.fillRect(x, toY(SHOT.PERFECT + SHOT.PERFECT_WINDOW), w, toY(SHOT.PERFECT - SHOT.PERFECT_WINDOW) - toY(SHOT.PERFECT + SHOT.PERFECT_WINDOW));
+    g.fillRect(toX(SHOT.PERFECT - SHOT.PERFECT_WINDOW), y, toX(SHOT.PERFECT + SHOT.PERFECT_WINDOW) - toX(SHOT.PERFECT - SHOT.PERFECT_WINDOW), h);
     // fill
-    const col = frozenValue !== null ? frozenColor : v > SHOT.PERFECT + SHOT.GOOD_WINDOW ? 0xff5a3c : 0xffd24a;
-    g.fillStyle(col, frozenValue !== null ? 1 : 0.85);
-    g.fillRect(x + 3, toY(v), w - 6, y + h - toY(v));
-    g.lineStyle(3, 0xffffff, 1);
-    g.lineBetween(x - 4, toY(v), x + w + 4, toY(v));
+    const late = v > SHOT.PERFECT + SHOT.GOOD_WINDOW;
+    const col = frozenValue !== null ? frozenColor : late ? 0xff5a3c : 0xffffff;
+    g.fillStyle(col, frozenValue !== null ? 0.95 : 0.8);
+    g.fillRoundedRect(x + 2, y + 3, Math.max(2, toX(v) - x - 2), h - 6, 3);
+    // target notch above and below the perfect spot
+    const px = toX(SHOT.PERFECT);
+    g.fillStyle(0xffffff, 1);
+    g.fillTriangle(px - 6, y - 10, px + 6, y - 10, px, y - 3);
+    g.fillTriangle(px - 6, y + h + 10, px + 6, y + h + 10, px, y + h + 3);
+    // cursor
+    g.lineStyle(3, frozenValue !== null ? frozenColor : 0xffffff, 1);
+    g.lineBetween(toX(v), y - 5, toX(v), y + h + 5);
   }
 }

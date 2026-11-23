@@ -1,6 +1,6 @@
 # Hardwood Heat
 
-A 3-on-3 half-court arcade basketball game that runs in the browser. Built with Phaser 3, TypeScript and Vite. All teams, players and branding are fictional, and every sound is synthesized at runtime, so the game has no asset files.
+A 5-on-5 full-court arcade basketball game set in a night-time boardwalk park, running in the browser. Built with Phaser 3, TypeScript and Vite. All teams, players and branding are fictional, and every sound is synthesized at runtime, so the game has no asset files.
 
 ## Run it
 
@@ -21,16 +21,18 @@ npm run dev        # http://localhost:5173
 | --- | --- | --- |
 | `WASD` / arrows | Move and dribble | Move |
 | `Shift` | Sprint (uses stamina) | Sprint |
-| `Space` | Hold, then release in the green zone to shoot. Near the rim it's a layup; sprint in for a dunk | Jump to contest or block |
-| `E` | Pass toward your movement direction or the mouse | Swipe for a steal |
+| `Space` | Hold, then release when the meter under your feet hits the green zone. Near the rim it's a layup; sprint in for a dunk | Jump to contest or block |
+| `F` | Crossover: switch hands with a burst. Catch a defender reaching and they hit the floor | |
+| `E` | Pass toward your movement direction or the mouse | |
+| `R` | | Swipe for a steal |
 | `Q` | Switch to the player nearest the ball | Same |
 | `Esc` / `P`, `M` | Pause, mute | |
 
 ## Rules
 
-- Baskets inside the arc are worth 2 and baskets beyond it are worth 3. The clock is 1, 2 or 3 minutes, and a game tied at the buzzer goes to sudden death (next basket wins).
-- The shot clock is 12 seconds and resets when the ball hits the rim.
-- After a defensive rebound or a steal, the ball must be cleared beyond the arc before a basket counts.
+- Full court, 5 on 5. Your team attacks the right-hand basket. After a score, the other team inbounds and brings it up the floor.
+- Baskets inside the arc are worth 2 and baskets beyond it are worth 3. The clock is 2, 3 or 5 minutes, and a game tied at the buzzer goes to sudden death (next basket wins).
+- The shot clock is 20 seconds and resets when the ball hits the rim.
 - Whether a shot goes in depends on the shooter's rating, distance, how close and well-placed the defender is, how fast the shooter is moving, stamina, and release timing. A perfect release on an open look almost always drops.
 
 ## How it's built
@@ -38,13 +40,15 @@ npm run dev        # http://localhost:5173
 ```
 src/
   config.ts            tuning: court geometry, physics, shot meter, difficulty levels
-  core/projection.ts   perspective broadcast camera (world feet -> screen)
+  core/projection.ts   side-on camera that pans along the court (world feet -> screen)
   sim/                 game simulation with no rendering (runs in node)
     Match.ts           rules, clocks, possession, shooting, passing, steals, blocks, stats
     Player.ts, Ball.ts movement, jumps, stamina, ball physics (floor, rim, backboard)
     shooting.ts        make-probability model
   ai/brain.ts          offense (drive / shoot / pass decisions, spacing, cuts), man defense, help, rebounding
-  render/              court texture, arena and crowd, animated hoop and net, character rig, effects
+  render/floor.ts      main court + park ground, projected per pixel by a GPU shader
+  render/Park.ts       skyline, string lights, palms, spectators, hoops and nets, background pickup games
+  render/              character rig and effects
   scenes/GameScene.ts  wires the sim to rendering, input and audio
   audio/               Web Audio synthesized sound effects and crowd ambience
   ui/                  HTML/CSS menus, team select, HUD, pause and results screens
@@ -54,8 +58,9 @@ scripts/               headless tests (usertest = mechanics, simtest = full game
 Notes on the design:
 
 - **The simulation is independent of rendering.** `Match` only knows about world coordinates. Because of that, the headless tests run real games in node, and the same `Match` drives the attract-mode demo behind the main menu.
-- **The court is drawn once, in perspective.** It is painted flat in world space (planks, wood grain, lines, paint), then warped row by row into the camera view. This is exact, because each world row maps to one screen row. Lighting and gloss are added on top.
-- **Players are drawn as a 3D-posed rig.** Joints are posed in each player's local frame (run cycle, defensive stance, dribble, jumper, layup, dunk, contest, reach), projected to the screen, depth-sorted, and drawn with an outline. Animation therefore works from any facing direction, and the floor reflections use the same pose mirrored below the floor.
+- **The ground is projected by a shader.** The court and the park around it are painted flat in world space once; a fragment shader inverts the camera for every pixel, so perspective stays exact while the camera pans. Shader textures must be power-of-two sized (Phaser binds them with REPEAT wrapping, which WebGL treats as black for other sizes).
+- **Static scenery is drawn once and slid.** Anything at a fixed depth (palms, light strings, background hoops) only needs a horizontal shift as the camera pans, so it is not redrawn each frame.
+- **Players are drawn as a 3D-posed rig.** Joints are posed in each player's local frame (run cycle, defensive stance, dribble, jumper, layup, dunk, contest, reach), projected to the screen, depth-sorted, and drawn with an outline. Animation therefore works from any facing direction, and the background pickup players reuse the same rig.
 - **The simulation runs on real elapsed time in fixed 1/60 s slices.** A low frame rate drops frames instead of slowing the game down.
 
 ## Extending

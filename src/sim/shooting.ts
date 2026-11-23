@@ -1,15 +1,7 @@
-import { COURT, SHOT } from '../config';
+import { SHOT } from '../config';
 import { clamp } from '../core/math';
+import { hoopDist, isThree } from './court';
 import type { Player } from './Player';
-
-export function isThree(x: number, y: number): boolean {
-  if (y < COURT.CORNER_Y) return x < COURT.CORNER_X || x > COURT.W - COURT.CORNER_X;
-  return Math.hypot(x - COURT.HOOP.x, y - COURT.HOOP.y) > COURT.THREE_R;
-}
-
-export function hoopDist(x: number, y: number): number {
-  return Math.hypot(x - COURT.HOOP.x, y - COURT.HOOP.y);
-}
 
 export type ReleaseGrade = 'PERFECT' | 'GOOD' | 'SLIGHTLY EARLY' | 'SLIGHTLY LATE' | 'EARLY' | 'LATE' | 'VERY LATE';
 
@@ -31,15 +23,17 @@ export function releaseQuality(m: number): { q: number; grade: ReleaseGrade } {
  */
 export function contestLevel(shooter: Player, defenders: Player[]): number {
   let best = 0;
-  const hx = COURT.HOOP.x - shooter.x;
-  const hy = COURT.HOOP.y - shooter.y;
+  const H = shooter.hoop;
+  const hx = H.x - shooter.x;
+  const hy = H.y - shooter.y;
   const hl = Math.hypot(hx, hy) || 1;
   for (const d of defenders) {
+    if (d.action === 'ankles') continue;
     const dx = d.x - shooter.x;
     const dy = d.y - shooter.y;
     const dd = Math.hypot(dx, dy);
     if (dd > 6) continue;
-    const front = (dx * hx + dy * hy) / (dd * hl || 1); // 1 = squarely between
+    const front = (dx * hx + dy * hy) / (dd * hl || 1);
     let c = clamp((5.8 - dd) / 4.6, 0, 1);
     c *= front > 0.2 ? 1 : front > -0.3 ? 0.6 : 0.25;
     if (d.airborne || d.action === 'contest') c *= 1.25;
@@ -51,8 +45,9 @@ export function contestLevel(shooter: Player, defenders: Player[]): number {
 
 /** Base make probability given distance and the shooter's relevant rating. */
 export function baseMakeChance(shooter: Player, x: number, y: number): number {
-  const d = hoopDist(x, y);
-  const three = isThree(x, y);
+  const H = shooter.hoop;
+  const d = hoopDist(x, y, H);
+  const three = isThree(x, y, H);
   let p: number;
   if (d < 4) p = 0.78;
   else if (d < 10) p = 0.6 - (d - 4) * 0.015;
@@ -73,11 +68,12 @@ export interface ShotEval {
 
 /** Full make probability for a jump shot. q = release quality (0..1). */
 export function jumpShotChance(shooter: Player, defenders: Player[], q: number, moveSpeed: number): ShotEval {
-  const three = isThree(shooter.x, shooter.y);
-  const dist = hoopDist(shooter.x, shooter.y);
+  const H = shooter.hoop;
+  const three = isThree(shooter.x, shooter.y, H);
+  const dist = hoopDist(shooter.x, shooter.y, H);
   const contest = contestLevel(shooter, defenders);
   let p = baseMakeChance(shooter, shooter.x, shooter.y);
-  p *= 0.42 + 0.78 * q; // timing
+  p *= 0.25 + 0.95 * q; // timing
   p *= 1 - 0.5 * contest;
   p *= 1 - clamp(moveSpeed / 26, 0, 0.25); // off-balance
   p *= 0.84 + 0.16 * Math.min(1, shooter.stamina * 1.6);
@@ -88,7 +84,7 @@ export function jumpShotChance(shooter: Player, defenders: Player[], q: number, 
 
 export function layupChance(shooter: Player, defenders: Player[], dunk: boolean): ShotEval {
   const contest = contestLevel(shooter, defenders);
-  const dist = hoopDist(shooter.x, shooter.y);
+  const dist = shooter.distToHoop();
   let p = dunk ? 0.9 + shooter.r.dunk / 1000 : 0.55 + shooter.r.finishing / 300;
   p *= 1 - (dunk ? 0.35 : 0.55) * contest;
   p *= 0.88 + 0.12 * Math.min(1, shooter.stamina * 1.6);
@@ -97,8 +93,10 @@ export function layupChance(shooter: Player, defenders: Player[], dunk: boolean)
 
 /** Rough expected value used by the AI to compare options (no timing randomness). */
 export function expectedShotValue(shooter: Player, x: number, y: number, defenders: Player[]): number {
-  const d = hoopDist(x, y);
-  const pts = isThree(x, y) ? 3 : 2;
+  const H = shooter.hoop;
+  const d = hoopDist(x, y, H);
+  if (d > 30) return 0;
+  const pts = isThree(x, y, H) ? 3 : 2;
   const saveX = shooter.x; const saveY = shooter.y;
   shooter.x = x; shooter.y = y;
   const ev = d < SHOT.LAYUP_RANGE

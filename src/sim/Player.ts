@@ -1,6 +1,7 @@
-import { MOVE, PHYS, COURT } from '../config';
+import { COURT, MOVE, MOVES, PHYS, type Hoop } from '../config';
 import { angleDiff, clamp } from '../core/math';
 import type { PlayerDef, TeamDef } from '../data/teams';
+import { attackHoop } from './court';
 
 export type Side = 0 | 1;
 
@@ -12,7 +13,9 @@ export type Action =
   | 'contest' // defensive jump
   | 'reach' // steal attempt
   | 'stumble' // beaten / failed steal
-  | 'pass' // brief passing pose
+  | 'ankles' // on the floor after a crossover
+  | 'crossover'
+  | 'pass'
   | 'celebrate';
 
 export interface PlayerStats {
@@ -29,11 +32,10 @@ export interface AiMemory {
   spotIdx: number;
   spotT: number;
   cutT: number;
-  plan: 'probe' | 'drive' | 'clear' | 'reset' | 'post';
+  plan: 'probe' | 'drive' | 'advance' | 'break' | 'reset';
   holdT: number;
   contestDelay: number;
   releaseAt: number;
-  helpT: number;
 }
 
 export class Player {
@@ -41,10 +43,12 @@ export class Player {
   readonly def: PlayerDef;
   readonly side: Side;
   readonly team: TeamDef;
-  x = 25; y = 30;
+  /** The basket this player's team attacks. */
+  readonly hoop: Hoop;
+  x = 47; y = 25;
   vx = 0; vy = 0;
   z = 0; vz = 0;
-  facing = -Math.PI / 2;
+  facing = 0;
   stamina = 1;
 
   action: Action = 'none';
@@ -62,19 +66,24 @@ export class Player {
 
   animPhase = Math.random() * 10;
   stealCd = 0;
+  crossCd = 0;
+  /** Which hand the ball is dribbled in, relative to facing (+1 right, -1 left). */
+  dribbleSide: 1 | -1 = 1;
   touchLock = 0; // cannot pick up the ball while > 0
   catchTime = 0; // match time when last caught a pass
   lastPasser: Player | null = null;
 
   isUser = false;
   stats: PlayerStats = emptyStats();
-  ai: AiMemory = { decideT: 0, tx: 25, ty: 25, spotIdx: -1, spotT: 0, cutT: 0, plan: 'probe', holdT: 0, contestDelay: 0, releaseAt: 0.8, helpT: 0 };
+  ai: AiMemory = { decideT: 0, tx: 47, ty: 25, spotIdx: -1, spotT: 0, cutT: 0, plan: 'probe', holdT: 0, contestDelay: 0, releaseAt: 0.8 };
 
   constructor(id: number, def: PlayerDef, side: Side, team: TeamDef) {
     this.id = id;
     this.def = def;
     this.side = side;
     this.team = team;
+    this.hoop = attackHoop(side);
+    this.facing = this.hoop.dir === 1 ? Math.PI : 0;
   }
 
   get r() { return this.def.ratings; }
@@ -83,7 +92,8 @@ export class Player {
 
   /** Busy players ignore movement input. */
   get locked(): boolean {
-    return this.action === 'jumpshot' || this.action === 'layup' || this.action === 'dunk' || this.action === 'contest' || this.action === 'stumble';
+    return this.action === 'jumpshot' || this.action === 'layup' || this.action === 'dunk' || this.action === 'contest'
+      || this.action === 'stumble' || this.action === 'ankles';
   }
 
   maxSpeed(hasBall: boolean, speedMult = 1): number {
@@ -106,17 +116,18 @@ export class Player {
   startJump(heightMult = 1) {
     if (this.airborne) return;
     const h = this.jumpHeight() * heightMult;
-    this.vz = Math.sqrt(2 * 44 * h);
+    this.vz = Math.sqrt(2 * PHYS.JUMP_G * h);
   }
 
   update(dt: number, hasBall: boolean, speedMult = 1) {
     this.actionT += dt;
     this.stealCd = Math.max(0, this.stealCd - dt);
+    this.crossCd = Math.max(0, this.crossCd - dt);
     this.touchLock = Math.max(0, this.touchLock - dt);
 
     // Vertical motion
     if (this.z > 0 || this.vz > 0) {
-      this.vz -= 44 * dt;
+      this.vz -= PHYS.JUMP_G * dt;
       this.z += this.vz * dt;
       if (this.z <= 0) { this.z = 0; this.vz = 0; }
     }
@@ -135,20 +146,25 @@ export class Player {
     const airborne = this.airborne;
     const scripted = this.action === 'layup' || this.action === 'dunk';
     if (!scripted) {
-      const accel = airborne ? 3 : (len > 0.05 && canMove ? MOVE.ACCEL : MOVE.DECEL);
+      let accel = airborne ? 3 : (len > 0.05 && canMove ? MOVE.ACCEL : MOVE.DECEL);
+      // A crossover is a burst: let the momentum carry before steering resumes.
+      if (this.action === 'crossover') accel *= 0.25;
       const dvx = tvx - this.vx;
       const dvy = tvy - this.vy;
       const dv = Math.hypot(dvx, dvy);
       const step = Math.min(dv, accel * dt);
       if (dv > 0) { this.vx += (dvx / dv) * step; this.vy += (dvy / dv) * step; }
     }
-    if (this.action === 'stumble') { this.vx *= Math.pow(0.02, dt); this.vy *= Math.pow(0.02, dt); }
+    if (this.action === 'stumble' || this.action === 'ankles') {
+      const f = Math.pow(this.action === 'ankles' ? 0.002 : 0.02, dt);
+      this.vx *= f; this.vy *= f;
+    }
     this.x += this.vx * dt;
     this.y += this.vy * dt;
 
-    // Stay on the half court (with a little out-of-bounds slack).
-    this.x = clamp(this.x, -1.5, COURT.W + 1.5);
-    this.y = clamp(this.y, -1, COURT.L - 0.6);
+    // Stay near the court
+    this.x = clamp(this.x, -1.5, COURT.L + 1.5);
+    this.y = clamp(this.y, -1.5, COURT.W + 1.5);
 
     // Stamina
     const speed = Math.hypot(this.vx, this.vy);
@@ -159,7 +175,7 @@ export class Player {
     let desired: number | null = null;
     if (this.faceTarget) desired = Math.atan2(this.faceTarget.y - this.y, this.faceTarget.x - this.x);
     else if (speed > 1.5) desired = Math.atan2(this.vy, this.vx);
-    if (desired !== null) {
+    if (desired !== null && this.action !== 'ankles') {
       const d = angleDiff(this.facing, desired);
       const rate = this.locked ? 6 : 14;
       this.facing += clamp(d, -rate * dt, rate * dt);
@@ -171,6 +187,8 @@ export class Player {
     if (this.action === 'reach' && this.actionT > 0.32) this.setAction('none');
     if (this.action === 'pass' && this.actionT > 0.25) this.setAction('none');
     if (this.action === 'stumble' && this.actionT > 0.45) this.setAction('none');
+    if (this.action === 'crossover' && this.actionT > MOVES.CROSSOVER_TIME) this.setAction('none');
+    if (this.action === 'ankles' && this.actionT > MOVES.ANKLES_TIME) this.setAction('none');
     if (this.action === 'contest' && this.actionT > 0.2 && this.z <= 0) this.setAction('none');
   }
 
@@ -178,7 +196,7 @@ export class Player {
 
   distTo(o: { x: number; y: number }): number { return Math.hypot(this.x - o.x, this.y - o.y); }
 
-  distToHoop(): number { return Math.hypot(this.x - COURT.HOOP.x, this.y - COURT.HOOP.y); }
+  distToHoop(): number { return Math.hypot(this.x - this.hoop.x, this.y - this.hoop.y); }
 
   static readonly RADIUS = PHYS.PLAYER_R;
 }

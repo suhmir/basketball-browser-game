@@ -19,7 +19,11 @@ function loadPrefs(): Prefs {
   const d: Prefs = { home: 0, away: 1, star: 0, difficulty: 'pro', time: RULES.DEFAULT_GAME_TIME, shake: true, hints: true };
   try {
     const raw = localStorage.getItem(PREFS_KEY);
-    if (raw) return { ...d, ...(JSON.parse(raw) as Partial<Prefs>) };
+    if (raw) {
+      const v = { ...d, ...(JSON.parse(raw) as Partial<Prefs>) };
+      if (![120, 180, 300].includes(v.time)) v.time = d.time;
+      return v;
+    }
   } catch { /* ignore */ }
   return d;
 }
@@ -76,10 +80,10 @@ export class UI {
         <div class="logo-lockup">
           <div class="logo-ball">${BALL_ICON}</div>
           <h1 class="game-logo"><span>HARDWOOD</span><span class="heat">HEAT</span></h1>
-          <div class="tagline">3-ON-3 ARCADE BASKETBALL</div>
+          <div class="tagline">5-ON-5 PARK BASKETBALL</div>
         </div>
         <nav class="menu" aria-label="Main menu">
-          <button class="menu-btn primary" data-act="play"><span>Play Game</span><i>Quick Play · 3v3</i></button>
+          <button class="menu-btn primary" data-act="play"><span>Play Game</span><i>Full court · 5v5</i></button>
           <button class="menu-btn" data-act="teams"><span>Teams</span><i>Rosters & ratings</i></button>
           <button class="menu-btn" data-act="settings"><span>Settings</span><i>Sound & display</i></button>
           <button class="menu-btn" data-act="controls"><span>Controls</span><i>How to play</i></button>
@@ -109,7 +113,7 @@ export class UI {
         <div class="opt">
           <label>Game Clock</label>
           <div class="seg" data-opt="time">
-            <button data-val="60">1:00</button><button data-val="120">2:00</button><button data-val="180">3:00</button>
+            <button data-val="120">2:00</button><button data-val="180">3:00</button><button data-val="300">5:00</button>
           </div>
         </div>
         <button class="tipoff" data-act="start">Tip Off ▸</button>
@@ -142,6 +146,7 @@ export class UI {
             <li><span class="keys"><kbd>Shift</kbd></span><span>Sprint (uses stamina)</span></li>
             <li><span class="keys"><kbd>Space</kbd> hold → release</span><span>Jump shot. Let go in the <b class="g">green</b> zone</span></li>
             <li><span class="keys"><kbd>Space</kbd> near rim</span><span>Layup — sprint in for a dunk</span></li>
+            <li><span class="keys"><kbd>F</kbd></span><span>Crossover — catch a defender reaching and break their ankles</span></li>
             <li><span class="keys"><kbd>E</kbd></span><span>Pass toward your movement / mouse</span></li>
             <li><span class="keys"><kbd>E</kbd> off-ball</span><span>Call for the ball</span></li>
           </ul>
@@ -150,7 +155,7 @@ export class UI {
           <h3>Defense</h3>
           <ul>
             <li><span class="keys"><kbd>Space</kbd></span><span>Jump to contest or block</span></li>
-            <li><span class="keys"><kbd>E</kbd></span><span>Swipe for a steal</span></li>
+            <li><span class="keys"><kbd>R</kbd></span><span>Swipe for a steal (gamble too much and get crossed)</span></li>
             <li><span class="keys"><kbd>Q</kbd></span><span>Switch to player nearest the ball</span></li>
             <li><span class="keys"><kbd>Esc</kbd> / <kbd>P</kbd></span><span>Pause</span></li>
             <li><span class="keys"><kbd>M</kbd></span><span>Mute</span></li>
@@ -159,8 +164,8 @@ export class UI {
         <div class="ctrl-card wide">
           <h3>Half-court rules</h3>
           <ul class="rules">
-            <li>Baskets are worth <b>2</b>, or <b>3</b> from beyond the arc.</li>
-            <li>After a defensive rebound or steal you must <b>clear the ball</b> beyond the arc before scoring.</li>
+            <li><b>Full court, 5 on 5.</b> Baskets are worth <b>2</b>, or <b>3</b> from beyond the arc.</li>
+            <li>After a score the other team inbounds and brings it up the floor — push the pace for fast breaks.</li>
             <li><b>${RULES.SHOT_CLOCK}-second</b> shot clock — it resets when the ball hits the rim.</li>
             <li>Shot odds depend on rating, distance, defender pressure, movement, stamina and release timing.</li>
             <li>Tied at the buzzer? <b>Next bucket wins.</b></li>
@@ -181,7 +186,6 @@ export class UI {
         <button class="icon-btn" data-act="pause" aria-label="Pause">${PAUSE_ICON}</button>
       </div>
       <div class="banner" aria-live="polite"><div class="banner-text"></div><div class="banner-sub"></div></div>
-      <div class="clear-flag">CLEAR THE BALL</div>
       <div class="player-card">
         <div class="pc-num"></div>
         <div class="pc-body">
@@ -467,8 +471,6 @@ export class UI {
     const sc = m.phase === 'live' && m.ball.state === 'loose' && m.ball.touchedRim ? '--' : String(Math.ceil(m.shotClock));
     this.set('shot', sc, (v) => { $(r, '.sb-shotclock').textContent = v; $(r, '.sb-shot').classList.toggle('low', v !== '--' && Number(v) <= 3); });
 
-    const showClear = m.needsClear && m.offense === m.cfg.userSide && m.phase === 'live';
-    this.set('clear', String(showClear), (v) => $(r, '.clear-flag').classList.toggle('on', v === 'true'));
 
     const u = m.user;
     if (u) {
@@ -605,11 +607,11 @@ function hintsFor(mode: string): string {
   const H = (keys: string, label: string) => `<div class="hint"><span>${keys}</span>${label}</div>`;
   switch (mode) {
     case 'ball':
-      return H('<kbd>Space</kbd>', 'Hold &amp; release to shoot') + H('<kbd>E</kbd>', 'Pass') + H('<kbd>Shift</kbd>', 'Sprint');
+      return H('<kbd>Space</kbd>', 'Hold &amp; release to shoot') + H('<kbd>F</kbd>', 'Crossover') + H('<kbd>E</kbd>', 'Pass') + H('<kbd>Shift</kbd>', 'Sprint');
     case 'offball':
       return H('<kbd>E</kbd>', 'Call for ball') + H('<kbd>Shift</kbd>', 'Sprint') + H('<kbd>Q</kbd>', 'Switch');
     case 'defense':
-      return H('<kbd>Space</kbd>', 'Contest / block') + H('<kbd>E</kbd>', 'Steal') + H('<kbd>Q</kbd>', 'Switch');
+      return H('<kbd>Space</kbd>', 'Contest / block') + H('<kbd>R</kbd>', 'Steal') + H('<kbd>Q</kbd>', 'Switch');
     case 'loose':
       return H('<kbd>Q</kbd>', 'Switch to nearest') + H('<kbd>Space</kbd>', 'Jump for it');
     default:

@@ -1,30 +1,33 @@
-import { COURT, SHOT } from '../config';
+import { COURT, SHOT, type Hoop } from '../config';
 import { chance, clamp, distToSegment, gauss, rand } from '../core/math';
+import { attackHoop, hoopDist, isThree, rel } from '../sim/court';
 import type { Match } from '../sim/Match';
 import type { Player } from '../sim/Player';
-import { expectedShotValue, isThree } from '../sim/shooting';
+import { expectedShotValue } from '../sim/shooting';
 
-const H = COURT.HOOP;
-
-/** Perimeter and interior spacing slots used by off-ball offense. */
+/** Hoop-relative spacing slots (u = feet from baseline, v = lateral offset). */
 const SPOTS = [
-  { x: 3.5, y: 6, tag: 'corner' },
-  { x: 46.5, y: 6, tag: 'corner' },
-  { x: 7, y: 20, tag: 'wing' },
-  { x: 43, y: 20, tag: 'wing' },
-  { x: 25, y: 31, tag: 'top' },
-  { x: 15, y: 29, tag: 'slot' },
-  { x: 35, y: 29, tag: 'slot' },
-  { x: 18.5, y: 15, tag: 'elbow' },
-  { x: 31.5, y: 15, tag: 'elbow' },
-  { x: 19, y: 4.5, tag: 'dunker' },
-  { x: 31, y: 4.5, tag: 'dunker' },
+  { u: 4, v: -21.5, tag: 'corner' },
+  { u: 4, v: 21.5, tag: 'corner' },
+  { u: 18, v: -19, tag: 'wing' },
+  { u: 18, v: 19, tag: 'wing' },
+  { u: 30, v: 0, tag: 'top' },
+  { u: 27, v: -11, tag: 'slot' },
+  { u: 27, v: 11, tag: 'slot' },
+  { u: 15, v: -7, tag: 'elbow' },
+  { u: 15, v: 7, tag: 'elbow' },
+  { u: 4, v: -7, tag: 'dunker' },
+  { u: 4, v: 7, tag: 'dunker' },
+  { u: 9, v: 0, tag: 'post' },
 ] as const;
+
+/** Feet from the attacking hoop beyond which a player is still bringing the ball up. */
+const TRANSITION_DIST = 33;
 
 export function runAI(m: Match, p: Player, dt: number) {
   p.sprint = false;
   const b = m.ball;
-  // Loose ball or shot in the air: rebounding behaviour for everyone.
+  if (p.action === 'ankles') { p.mx = 0; p.my = 0; return; }
   if (b.state === 'loose' || b.state === 'shot') {
     reboundAI(m, p);
     return;
@@ -53,8 +56,18 @@ function steer(p: Player, tx: number, ty: number, opts: { sprintBeyond?: number;
 }
 
 function clampTarget(ai: { tx: number; ty: number }) {
-  ai.tx = clamp(ai.tx, 1, COURT.W - 1);
-  ai.ty = clamp(ai.ty, 1.5, COURT.L - 3);
+  ai.tx = clamp(ai.tx, 1.5, COURT.L - 1.5);
+  ai.ty = clamp(ai.ty, 1.5, COURT.W - 1.5);
+}
+
+function spotWorld(H: Hoop, i: number) {
+  return rel(H, SPOTS[i].u, SPOTS[i].v);
+}
+
+/** Defenders who are between the player and the hoop (i.e. back in position). */
+function defendersBack(m: Match, p: Player): number {
+  const d0 = p.distToHoop();
+  return m.opponents(p).filter((o) => hoopDist(o.x, o.y, p.hoop) < d0 - 2).length;
 }
 
 // --------------------------------------------------------------- offense: ball handler
@@ -62,8 +75,8 @@ function clampTarget(ai: { tx: number; ty: number }) {
 function handlerAI(m: Match, p: Player, dt: number) {
   const ai = p.ai;
   ai.holdT += dt;
+  const H = p.hoop;
 
-  // Already shooting: decide when to let go
   if (p.action === 'jumpshot') {
     if (p.charging && p.charge >= ai.releaseAt) m.releaseJumper(p);
     return;
@@ -81,50 +94,52 @@ function handlerAI(m: Match, p: Player, dt: number) {
   if (ai.decideT <= 0) {
     ai.decideT = rand(0.18, 0.34);
 
-    // 1) Must clear?
-    if (m.needsClear && !isThree(p.x, p.y)) {
-      ai.plan = 'clear';
-      const a = Math.atan2(p.y - H.y, p.x - H.x);
-      const r = COURT.THREE_R + 2.5;
-      ai.tx = H.x + Math.cos(a) * r;
-      ai.ty = Math.max(COURT.CORNER_Y + 2, H.y + Math.sin(a) * r);
-      clampTarget(ai);
+    if (dHoop > TRANSITION_DIST) {
+      // Bring it up. Push the pace when the defense isn't back.
+      const back = defendersBack(m, p);
+      const ahead = mates.filter((t) => t.distToHoop() < dHoop - 4);
+      if (back <= 1 && dHoop < 60) {
+        ai.plan = 'break';
+      } else {
+        ai.plan = 'advance';
+        const tgt = rel(H, 28, clamp(p.y - 25, -12, 12));
+        ai.tx = tgt.x; ai.ty = tgt.y;
+      }
+      // Hit an open man streaking ahead
+      for (const t of ahead) {
+        const open = m.nearestOpponentDist(t);
+        if (open > 7 && laneOpen(p, t, defs) > 3 && t.distToHoop() < 22 && chance(0.5 + tune.aiIq * 0.3)) {
+          m.passBall(p, t);
+          return;
+        }
+      }
     } else {
-      const myEv = expectedShotValue(p, p.x, p.y, defs);
-      // Shot clock pressure lowers the bar
+      // Slight preference for attacking over settling for threes
+      const myEv = expectedShotValue(p, p.x, p.y, defs) * (isThree(p.x, p.y, H) ? 0.9 : 1);
       const urgency = clamp((5 - m.shotClock) / 5, 0, 1);
       const patience = clamp(ai.holdT / 4, 0, 1);
-      let bar = 1.28 - urgency * 0.6 - patience * 0.2 + (m.time < 4 ? 0.2 : 0);
-      if (m.needsClear) bar = 99;
+      const bar = 1.12 - urgency * 0.55 - patience * 0.2;
 
-      // At the rim: finish
-      if (dHoop < SHOT.LAYUP_RANGE - 0.4 && !m.needsClear) {
-        m.beginShot(p);
-        return;
-      }
+      if (dHoop < SHOT.LAYUP_RANGE - 0.4) { m.beginShot(p); return; }
 
-      // Look for a better pass
       let bestMate: Player | null = null;
       let bestMateEv = -1;
       for (const t of mates) {
-        const lane = laneOpen(p, t, defs);
-        if (lane < 2.2) continue;
-        let ev = expectedShotValue(t, t.x, t.y, defs);
+        if (laneOpen(p, t, defs) < 2.2) continue;
+        let ev = expectedShotValue(t, t.x, t.y, defs) * (isThree(t.x, t.y, H) ? 0.9 : 1);
         if (t.distToHoop() < 8 && t.speed > 6) ev += 0.35; // cutter
         if (ev > bestMateEv) { bestMateEv = ev; bestMate = t; }
       }
 
-      const passMargin = 0.18 - tune.aiIq * 0.1;
-      if (m.shotClock < 1.4 && !m.needsClear) {
-        m.beginShot(p);
-        if (p.charging) ai.releaseAt = pickRelease(m, p);
+      if (m.shotClock < 1.4) {
+        if (m.beginShot(p) && p.charging) ai.releaseAt = pickRelease(m, p);
         return;
       }
       if (myEv > bar && defDist > 3.6 && chance(0.85)) {
         if (m.beginShot(p) && p.charging) ai.releaseAt = pickRelease(m, p);
         return;
       }
-      if (bestMate && ai.holdT > 0.5 && bestMateEv > myEv + passMargin && chance(0.45 + tune.aiIq * 0.4)) {
+      if (bestMate && ai.holdT > 0.5 && bestMateEv > myEv + (0.18 - tune.aiIq * 0.1) && chance(0.45 + tune.aiIq * 0.4)) {
         m.passBall(p, bestMate);
         return;
       }
@@ -133,34 +148,45 @@ function handlerAI(m: Match, p: Player, dt: number) {
         return;
       }
 
-      // Drive if the lane is open
-      const between = distToSegment(myDef.x, myDef.y, p.x, p.y, H.x, H.y + 1.5);
-      const defBehind = myDef.distToHoop() > dHoop + 0.5;
+      // Shake a tight defender with a crossover
+      if (defDist < 4.5 && p.crossCd <= 0 && chance(0.18 * (p.r.handling / 85))) {
+        const side = Math.random() < 0.5 ? 1 : -1;
+        const toward = Math.atan2(H.y - p.y, H.x - p.x) + side * 0.9;
+        if (m.crossover(p, Math.cos(toward), Math.sin(toward))) { ai.plan = 'drive'; ai.decideT = 0.4; }
+      }
+
+      const between = distToSegment(myDef.x, myDef.y, p.x, p.y, H.x, H.y);
+      const defBehind = hoopDist(myDef.x, myDef.y, H) > dHoop + 0.5 || myDef.action === 'ankles';
       const blowBy = chance(0.12 + (p.r.speed + p.r.handling - myDef.r.defense * 2) / 300);
-      if ((between > 2.4 || defBehind || blowBy) && dHoop > 4 && chance(0.75)) {
+      const laneClear = m.opponents(p).filter((o) => distToSegment(o.x, o.y, p.x, p.y, H.x, H.y) < 3).length <= 1;
+      if ((between > 2.4 || defBehind || blowBy || (laneClear && chance(0.4))) && dHoop > 4 && chance(0.8)) {
         ai.plan = 'drive';
-        ai.tx = H.x + (p.x - H.x) * 0.12;
-        ai.ty = H.y + 2.5;
-      } else if (chance(0.35) || ai.plan === 'clear' || Math.hypot(ai.tx - p.x, ai.ty - p.y) < 1) {
+      } else if (chance(0.35) || ai.plan !== 'probe' || Math.hypot(ai.tx - p.x, ai.ty - p.y) < 1) {
         ai.plan = 'probe';
-        // Jab toward a spot away from the defender, staying near the arc.
-        const away = Math.atan2(p.y - myDef.y, p.x - myDef.x);
-        const base = Math.atan2(p.y - H.y, p.x - H.x) + gauss(0, 0.5) + (Math.sin(away) * 0.2);
+        const base = Math.atan2(p.y - H.y, p.x - H.x) + gauss(0, 0.5);
         const r = clamp(dHoop + rand(-5, 3), 12, 26);
         ai.tx = H.x + Math.cos(base) * r;
-        ai.ty = Math.max(3, H.y + Math.sin(base) * r);
+        ai.ty = H.y + Math.sin(base) * r;
+        // stay on the court side of the hoop
+        if ((ai.tx - H.x) * H.dir < 1) ai.tx = H.x + H.dir * 1;
         clampTarget(ai);
       }
     }
   }
 
-  if (ai.plan === 'drive') {
-    steer(p, ai.tx, ai.ty, { sprintBeyond: 4 });
+  if (ai.plan === 'drive' && dHoop > 7 && dHoop < 17 && p.speed < 5 && defDist < 3 && chance(0.06)) {
+    // Stalled in traffic: pull up
+    if (m.beginShot(p) && p.charging) ai.releaseAt = pickRelease(m, p);
+    return;
+  }
+  if (ai.plan === 'break' || ai.plan === 'drive') {
+    const tgt = { x: H.x + H.dir * 2.2, y: H.y + (p.y - H.y) * 0.12 };
+    steer(p, tgt.x, tgt.y, { sprintBeyond: 4 });
     p.sprint = p.stamina > 0.2;
-    if (dHoop < SHOT.LAYUP_RANGE - 0.3 && !m.needsClear) m.beginShot(p);
-    else if (p.r.dunk >= 70 && dHoop < SHOT.DUNK_RANGE && p.speed > 9 && !m.needsClear && chance(0.4)) m.beginShot(p);
+    if (dHoop < SHOT.LAYUP_RANGE - 0.3) m.beginShot(p);
+    else if (p.r.dunk >= 70 && dHoop < SHOT.DUNK_RANGE && p.speed > 9 && chance(0.4)) m.beginShot(p);
   } else {
-    steer(p, ai.tx, ai.ty, { sprintBeyond: 12, speed: ai.plan === 'clear' ? 1 : 0.75 });
+    steer(p, ai.tx, ai.ty, { sprintBeyond: 12, speed: ai.plan === 'advance' ? 0.95 : 0.75 });
   }
 }
 
@@ -180,14 +206,12 @@ function pickRelease(m: Match, p: Player): number {
 function offBallAI(m: Match, p: Player, dt: number) {
   const ai = p.ai;
   const b = m.ball;
+  const H = p.hoop;
   const handler = m.handler;
 
-  // Receiving a pass: move to meet it
   if (b.state === 'pass' && b.pass?.to === p) {
     const T = Math.max(0, b.pass.T - b.pass.t);
-    const lx = b.x + b.vx * T;
-    const ly = b.y + b.vy * T;
-    steer(p, lx, ly, { sprintBeyond: 3, slowRadius: 1 });
+    steer(p, b.x + b.vx * T, b.y + b.vy * T, { sprintBeyond: 3, slowRadius: 1 });
     p.faceTarget = { x: b.x, y: b.y };
     return;
   }
@@ -195,48 +219,56 @@ function offBallAI(m: Match, p: Player, dt: number) {
   ai.spotT -= dt;
   ai.cutT -= dt;
 
-  // Cutting to the rim
+  // Transition: run the floor, filling a lane ahead of the ball.
+  if (handler && handler.distToHoop() > TRANSITION_DIST && p.distToHoop() > 14) {
+    if (ai.spotIdx < 0 || ai.spotT <= 0) { ai.spotIdx = chooseSpot(m, p); ai.spotT = rand(2, 3.5); }
+    const s = spotWorld(H, ai.spotIdx);
+    steer(p, s.x, s.y, { sprintBeyond: 6 });
+    return;
+  }
+
   if (ai.cutT > 0) {
-    const tx = H.x + (p.x < H.x ? -2 : 2);
-    steer(p, tx, H.y + 3.5, { sprintBeyond: 2 });
-    if (p.distTo({ x: tx, y: H.y + 3.5 }) < 1.5) ai.cutT = Math.min(ai.cutT, 0.6);
+    const tx = H.x + H.dir * 3.5;
+    const ty = H.y + (p.y < H.y ? -2 : 2);
+    steer(p, tx, ty, { sprintBeyond: 2 });
+    if (p.distTo({ x: tx, y: ty }) < 1.5) ai.cutT = Math.min(ai.cutT, 0.6);
     return;
   }
 
   if (ai.spotT <= 0 || ai.spotIdx < 0) {
     ai.spotT = rand(1.6, 3.4);
     ai.spotIdx = chooseSpot(m, p);
-    // Backdoor cut when the defender is ball-watching or far away
-    const myDef = [...m.assign.entries()].find(([, man]) => man === p);
-    const defender = myDef ? m.players.find((x) => x.id === myDef[0]) : null;
+    const myDefEntry = [...m.assign.entries()].find(([, man]) => man === p);
+    const defender = myDefEntry ? m.players.find((x) => x.id === myDefEntry[0]) : null;
     const defGap = defender ? defender.distTo(p) : 99;
-    if (handler && p.distToHoop() > 10 && (defGap > 6 || chance(0.12 * m.tune.aiIq)) && chance(0.4)) {
+    if (handler && p.distToHoop() > 10 && (defGap > 6 || chance(0.12 * m.tune.aiIq)) && chance(0.35)) {
       ai.cutT = rand(1.1, 1.6);
       return;
     }
   }
-  const s = SPOTS[ai.spotIdx];
+  const s = spotWorld(H, ai.spotIdx);
   steer(p, s.x, s.y, { sprintBeyond: 10, speed: 0.8 });
   p.faceTarget = handler ? { x: handler.x, y: handler.y } : null;
 }
 
 function chooseSpot(m: Match, p: Player): number {
+  const H = p.hoop;
   const others = m.players.filter((o) => o.side === p.side && o !== p);
   const handler = m.handler;
   let best = 0;
   let bestScore = -Infinity;
-  SPOTS.forEach((s, i) => {
+  SPOTS.forEach((_, i) => {
+    const s = spotWorld(H, i);
     let minMate = 99;
     for (const o of others) {
-      // Use a teammate's chosen spot if they have one, else their position
-      const os = o !== handler && o.ai.spotIdx >= 0 ? SPOTS[o.ai.spotIdx] : o;
+      const os = o !== handler && o.ai.spotIdx >= 0 ? spotWorld(H, o.ai.spotIdx) : o;
       minMate = Math.min(minMate, Math.hypot(os.x - s.x, os.y - s.y));
     }
-    let score = Math.min(minMate, 16) * 1.0;
-    score -= Math.hypot(s.x - p.x, s.y - p.y) * 0.18;
-    // Shooters like the perimeter, bigs like the paint
+    let score = Math.min(minMate, 14);
+    score -= Math.hypot(s.x - p.x, s.y - p.y) * 0.08;
     const shooter = (p.r.three - 60) / 20;
-    if (s.tag === 'corner' || s.tag === 'wing' || s.tag === 'top' || s.tag === 'slot') score += shooter;
+    const tag = SPOTS[i].tag;
+    if (tag === 'corner' || tag === 'wing' || tag === 'top' || tag === 'slot') score += shooter;
     else score += (p.r.finishing - 70) / 15 - shooter * 0.5;
     if (handler && Math.hypot(handler.x - s.x, handler.y - s.y) < 9) score -= 8;
     score += Math.random() * 2.5;
@@ -252,20 +284,21 @@ function defenseAI(m: Match, p: Player, dt: number) {
   const b = m.ball;
   const tune = m.tune;
   const userMatch = m.cfg.userSide !== null;
-  // AI on the user's own team defends at a solid "pro" level regardless of difficulty.
-  const react = userMatch && p.side === m.cfg.userSide ? 6 : tune.defReact;
-  const gap = userMatch && p.side === m.cfg.userSide ? 3.2 : tune.defGap;
+  const isUserTeam = userMatch && p.side === m.cfg.userSide;
+  const react = isUserTeam ? 6 : tune.defReact;
+  const gap = isUserTeam ? 3.2 : tune.defGap;
+  // The basket this defender protects
+  const H = attackHoop(m.offense);
 
   let man = m.assign.get(p.id);
-  if (!man) { m.reassignDefense(); man = m.assign.get(p.id); }
+  if (!man) { m.reassignDefense(false); man = m.assign.get(p.id); }
   if (!man) return;
   const handler = m.handler;
 
-  // Pass in the air: jump the lane if it's close
   if (b.state === 'pass' && b.pass) {
-    const end = { x: b.x + b.vx * (b.pass.T - b.pass.t), y: b.y + b.vy * (b.pass.T - b.pass.t) };
-    const laneD = distToSegment(p.x, p.y, b.x, b.y, end.x, end.y);
-    if (laneD < 4.5) {
+    const rem = b.pass.T - b.pass.t;
+    const end = { x: b.x + b.vx * rem, y: b.y + b.vy * rem };
+    if (distToSegment(p.x, p.y, b.x, b.y, end.x, end.y) < 3) {
       steer(p, end.x * 0.4 + b.x * 0.6, end.y * 0.4 + b.y * 0.6, { sprintBeyond: 0 });
       return;
     }
@@ -273,43 +306,52 @@ function defenseAI(m: Match, p: Player, dt: number) {
 
   let tx: number;
   let ty: number;
+  const manHoop = hoopDist(man.x, man.y, H);
   if (man === handler) {
-    // On-ball: stay between man and hoop at a cushion
     const dx = H.x - man.x; const dy = H.y - man.y; const dl = Math.hypot(dx, dy) || 1;
-    const g = man.distToHoop() < 9 ? Math.min(gap, 2.2) : gap;
-    tx = man.x + (dx / dl) * g + man.vx * 0.12;
-    ty = man.y + (dy / dl) * g + man.vy * 0.12;
+    if (manHoop > 36) {
+      // Don't pressure full court: wait around the top of the key extended.
+      const wait = Math.min(manHoop - gap, 34);
+      tx = H.x - (dx / dl) * wait;
+      ty = H.y - (dy / dl) * wait;
+    } else {
+      const g = manHoop < 9 ? Math.min(gap, 2.2) : gap;
+      tx = man.x + (dx / dl) * g + man.vx * 0.12;
+      ty = man.y + (dy / dl) * g + man.vy * 0.12;
+    }
     p.faceTarget = { x: man.x, y: man.y };
 
-    // Contest shots
     if (man.action === 'jumpshot' || man.action === 'layup' || man.action === 'dunk') {
       tx = man.x + (dx / dl) * 1.6; ty = man.y + (dy / dl) * 1.6;
       if (ai.contestDelay <= 0) ai.contestDelay = rand(0.08, 0.26) * (10 / (react + 4));
       ai.contestDelay -= dt;
-      if (ai.contestDelay <= 0.02 && !p.airborne && p.distTo(man) < 6.5 && chance(userMatch && p.side !== m.cfg.userSide ? tune.contestChance : 0.8)) {
+      if (ai.contestDelay <= 0.02 && !p.airborne && p.distTo(man) < 6.5 && chance(userMatch && !isUserTeam ? tune.contestChance : 0.8)) {
         m.contestJump(p);
-        ai.contestDelay = 9; // one jump per shot
+        ai.contestDelay = 9;
       }
     } else {
       ai.contestDelay = 0;
-      // Steal attempts
-      const stealRate = (userMatch && p.side !== m.cfg.userSide ? tune.stealRate : 0.25) * (p.r.steal / 70);
+      const stealRate = (userMatch && !isUserTeam ? tune.stealRate : 0.25) * (p.r.steal / 70);
       if (p.distTo(man) < 3.4 && p.stealCd <= 0 && Math.random() < stealRate * dt) m.attemptSteal(p);
     }
   } else {
-    // Off-ball: sag toward the hoop and shade toward the ball
-    const ballX = b.x; const ballY = b.y;
-    tx = man.x + (H.x - man.x) * 0.32 + (ballX - man.x) * 0.16;
-    ty = man.y + (H.y - man.y) * 0.32 + (ballY - man.y) * 0.16;
-    p.faceTarget = { x: ballX, y: ballY };
+    // Off-ball: sag toward the hoop and shade toward the ball; never get caught upcourt.
+    tx = man.x + (H.x - man.x) * 0.2 + (b.x - man.x) * 0.12;
+    ty = man.y + (H.y - man.y) * 0.2 + (b.y - man.y) * 0.12;
+    const d = hoopDist(tx, ty, H);
+    if (d > 30) {
+      tx = H.x + ((tx - H.x) / d) * 30;
+      ty = H.y + ((ty - H.y) / d) * 30;
+    }
+    p.faceTarget = { x: b.x, y: b.y };
 
-    // Help defense: driver beat his man and is near the rim
+    // Help: driver beat his man near the rim
     if (handler && handler.side !== p.side) {
-      const hd = handler.distToHoop();
-      const onBall = m.players.find((d) => m.assign.get(d.id) === handler);
-      const beaten = onBall ? onBall.distToHoop() > hd + 1.2 : true;
+      const hd = hoopDist(handler.x, handler.y, H);
+      const onBall = m.players.find((d2) => m.assign.get(d2.id) === handler);
+      const beaten = onBall ? hoopDist(onBall.x, onBall.y, H) > hd + 1.2 || onBall.action === 'ankles' : true;
       if (hd < 14 && beaten) {
-        const helpers = m.team(p.side).filter((d) => d !== onBall).sort((a, c) => a.distTo(handler) - c.distTo(handler));
+        const helpers = m.team(p.side).filter((d2) => d2 !== onBall).sort((a, c) => a.distTo(handler) - c.distTo(handler));
         if (helpers[0] === p) {
           tx = handler.x + (H.x - handler.x) * 0.45;
           ty = handler.y + (H.y - handler.y) * 0.45;
@@ -319,50 +361,51 @@ function defenseAI(m: Match, p: Player, dt: number) {
     }
   }
 
-  // Reaction lag: smooth the target
   const k = Math.min(1, dt * react);
   ai.tx += (tx - ai.tx) * k;
   ai.ty += (ty - ai.ty) * k;
   const d = steer(p, ai.tx, ai.ty, { sprintBeyond: 5, slowRadius: 1.6 });
-  if (d > 3 && man === handler) p.sprint = p.stamina > 0.15;
+  // Sprint back in transition
+  if (d > 3 && (man === handler || hoopDist(p.x, p.y, H) > hoopDist(man.x, man.y, H))) p.sprint = p.stamina > 0.15;
 }
 
 // --------------------------------------------------------------- rebounds / loose balls
 
 function reboundAI(m: Match, p: Player) {
   const b = m.ball;
-  // Predict where the ball comes down to around chest height
+  const H = b.shot?.hoop ?? (b.x < COURT.L / 2 ? COURT.HOOPS[0] : COURT.HOOPS[1]);
   let px = b.x; let py = b.y;
-  if (b.state === 'shot' || b.z > 4) {
+  if (b.state === 'shot') {
+    const a = Math.atan2(p.y - H.y, p.x - H.x);
+    px = H.x + Math.cos(a) * 4.5;
+    py = H.y + Math.sin(a) * 4.5;
+    if ((px - H.x) * H.dir < 0.5) px = H.x + H.dir * 0.5;
+  } else if (b.z > 4) {
     let x = b.x, y = b.y, z = b.z, vz = b.vz;
-    for (let i = 0; i < 60 && (z > 5 || vz > 0); i++) {
-      x += b.vx * 0.03; y += b.vy * 0.03; vz -= 40 * 0.03; z += vz * 0.03;
-    }
+    for (let i = 0; i < 60 && (z > 5 || vz > 0); i++) { x += b.vx * 0.03; y += b.vy * 0.03; vz -= 40 * 0.03; z += vz * 0.03; }
     px = x; py = y;
-    if (b.state === 'shot') {
-      // shots land near the rim: aim a couple of feet out
-      const a = Math.atan2(p.y - H.y, p.x - H.x);
-      px = H.x + Math.cos(a) * 4.5; py = Math.max(2, H.y + Math.sin(a) * 4.5);
-    }
   } else {
     px = b.x + b.vx * 0.25; py = b.y + b.vy * 0.25;
   }
 
-  // Shooter's follow-through: let them land first
   if (p.locked) return;
 
-  // Two closest from each team crash; the third gets back for balance
+  const near = hoopDist(b.x, b.y, H) < 30;
   const mates = m.team(p.side).sort((a, c) => a.distTo({ x: px, y: py }) - c.distTo({ x: px, y: py }));
   const rank = mates.indexOf(p);
-  if (rank <= 1 || b.state === 'loose') {
+  // Two closest chase (three on a truly loose ball); the rest get into position.
+  if (rank <= 1 || (b.state === 'loose' && (rank <= 2 || !near))) {
     const d = steer(p, px, py, { sprintBeyond: 3, slowRadius: 0.8 });
     p.sprint = d > 2 && p.stamina > 0.1;
-    // Go up for it
     if (b.state === 'loose' && d < 2.2 && b.z > p.def.height * 1.15 && b.z < 11 && b.vz < 4 && !p.airborne && chance(0.25)) {
       m.contestJump(p);
     }
   } else {
-    steer(p, 25, 28, { speed: 0.7 });
+    const shootingTeam = p.side === (b.shot?.shooter.side ?? b.lastTouch);
+    // Shooting team's extra players get back; the other team leaks out to the wings.
+    const own = attackHoop((1 - p.side) as 0 | 1);
+    const s = shootingTeam ? rel(own, 30, (rank % 2 ? 1 : -1) * 8) : rel(H, 24, (rank % 2 ? 1 : -1) * 17);
+    steer(p, s.x, s.y, { speed: 0.85, sprintBeyond: 14 });
   }
   p.faceTarget = { x: b.x, y: b.y };
 }
